@@ -730,8 +730,8 @@ idp-cli bootstrap --prompt "Bank statements with account holder and transactions
 **Note:** The created version is **not** activated automatically (unlike the web UI
 Quick Start). Activate it from **Configuration › View/Edit Configuration** in the UI
 when you're ready to process documents with it. Synthetic generation is optional and
-requires the IDP Data Generator extension (deployed stack) or
-`pip install "idp_common[synthesis]"` (local); without it, the config is still
+requires the Test Set Generator extension (deployed stack) or
+`pip install -e "lib/idp_common_pkg[synthesis]"` (local); without it, the config is still
 created and you can upload your own documents to build a test set. See the
 [Quick Start guide](./quick-start.md) for the full workflow.
 
@@ -2643,7 +2643,7 @@ Discover document classes from a collection of documents using embedding-based c
 
 Unlike `discover` (which analyzes one document at a time), `discover-multidoc` analyzes a directory of mixed documents to automatically identify document types, cluster similar documents, and generate JSON Schemas for each discovered class.
 
-**Requires:** `pip install idp-common[multi_document_discovery]` (scikit-learn, scipy, numpy, strands-agents)
+**Requires:** `pip install -e "lib/idp_common_pkg[multi_document_discovery]"` (scikit-learn, scipy, numpy, strands-agents)
 
 **Note:** Requires at least **2 documents per expected class**. Clusters with fewer than 2 documents are filtered as noise. For discovering schemas from individual documents, use [`discover`](#discover) instead.
 

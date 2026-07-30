@@ -21,7 +21,7 @@ exclude = [
 
 [project]
 name = "idp_common"
-version = "0.6.1"
+version = "0.6.2"
 description = "Common utilities for GenAI IDP Accelerator patterns"
 authors = [{ name = "AWS", email = "noreply@amazon.com" }]
 requires-python = ">=3.12,<3.14"
@@ -126,9 +126,22 @@ multi_document_discovery = [
   "strands-agents==1.14.0; python_version>='3.10'",  # Agentic schema generation
 ]
 
-# Synthesis / cold-start bootstrap dependencies
+# Synthesis / cold-start bootstrap dependencies. Schema authoring + config /
+# test-set creation only need jsonschema; the document GENERATOR is a separate,
+# heavier extra (see synthesis-generator) so the base capability stays light.
 synthesis = [
   "jsonschema>=4.0.0",
+]
+
+# Optional synthetic-document generator (SEED). Heavy (Strands + Bedrock +
+# rendering); install only where document generation actually runs. The engine
+# adapter imports it lazily and degrades gracefully when absent.
+# NOTE: seed-data requires numpy 2.x (opencv/scikit-image/numba), which conflicts
+# with the numpy==1.26.4 pin in the ocr/evaluation/all extras. Install this in an
+# isolated environment (the generator's own container / AgentCore runtime), NOT
+# alongside idp_common[ocr|evaluation|all].
+synthesis-generator = [
+  "seed-data>=0.0.6",
 ]
 
 # Code intelligence module dependencies
@@ -168,7 +181,10 @@ test = [
   "moto>=5.1.8",
   "pytest-asyncio>=1.1.0",
   "typer>=0.19.2",
-  "ruff>=0.14.0",
+  # Keep in sync with the ruff pin in .gitlab-ci.yml. Cap below 0.16: ruff 0.16
+  # formats Python code blocks in Markdown files, which fails `ruff format
+  # --check` on ~49 README/skill-file snippets during CodeBuild publish.
+  "ruff>=0.14.0,<0.16",
   "deepdiff>=6.0.0",                    # Required for BDA blueprint service tests
   "datamodel-code-generator>=0.25.0",   # Required for schema/pydantic generator tests
   "mypy-boto3-bedrock-runtime>=1.39.0", # Required for bedrock_utils tests

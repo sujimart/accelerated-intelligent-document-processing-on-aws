@@ -36,8 +36,18 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from .s3_security import apply_enforce_ssl_only
+
 LIB_DEPENDENCY = "./lib/idp_common_pkg/idp_common"
 LIB_PKG_PATH = "./lib/idp_common_pkg"
+
+# Files the multi-doc discovery CodeBuild project needs from the source zip in
+# order to build its container image. Kept as a constant so the packaging step
+# and its test assert on the same list.
+MULTI_DOC_DISCOVERY_BUILD_INPUTS = (
+    "nested/multi-doc-discovery/Dockerfile",
+    "nested/multi-doc-discovery/requirements.txt",
+)
 
 
 class IDPPublisher:
@@ -571,6 +581,20 @@ STDERR:
         try:
             self.s3_client.head_bucket(Bucket=self.bucket)
             self.console.print(f"[green]Using existing bucket: {self.bucket}[/green]")
+            # Additive hardening on a bucket we didn't create: ensure non-TLS
+            # requests are denied. Never fatal — the operator may own the
+            # bucket policy and not have granted us s3:PutBucketPolicy.
+            if apply_enforce_ssl_only(
+                self.s3_client, self.bucket, self.region, raise_on_error=False
+            ):
+                self.console.print(
+                    "[green]EnforceSSLOnly bucket policy in place[/green]"
+                )
+            else:
+                self.console.print(
+                    "[yellow]Could not verify/apply the EnforceSSLOnly bucket policy "
+                    "on the existing bucket — add it manually.[/yellow]"
+                )
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
             if error_code == "404":
@@ -593,7 +617,15 @@ STDERR:
                         Bucket=self.bucket,
                         VersioningConfiguration={"Status": "Enabled"},
                     )
-                except ClientError as create_error:
+
+                    # Deny any non-TLS request (same EnforceSSLOnly statement
+                    # the CloudFormation-managed buckets carry). Fatal here —
+                    # we just created the bucket, so we own its policy.
+                    apply_enforce_ssl_only(self.s3_client, self.bucket, self.region)
+                    self.console.print(
+                        "[green]Applied EnforceSSLOnly bucket policy[/green]"
+                    )
+                except (ClientError, RuntimeError) as create_error:
                     self.console.print(
                         f"[red]Failed to create bucket: {create_error}[/red]"
                     )
@@ -1333,6 +1365,21 @@ STDERR:
                     arcname = os.path.relpath(file_path, ".")
                     zipf.write(file_path, arcname)
 
+            # Add the build inputs themselves. The CodeBuild buildspec builds
+            # `-f nested/multi-doc-discovery/Dockerfile`, which in turn COPYs
+            # nested/multi-doc-discovery/requirements.txt, so BOTH must be in
+            # the zip. They used to be heredoc'd inline in the buildspec, which
+            # let the real files (and Dependabot's security bumps to them) drift
+            # out of the image entirely.
+            for build_input in MULTI_DOC_DISCOVERY_BUILD_INPUTS:
+                if not os.path.isfile(build_input):
+                    self.console.print(
+                        f"[red]❌ Missing multi-doc discovery build input: "
+                        f"{build_input}[/red]"
+                    )
+                    sys.exit(1)
+                zipf.write(build_input, build_input)
+
         self.console.print(
             f"[green]✅ Created multi-doc discovery source zip ({os.path.getsize(zipfile_path) / 1024 / 1024:.2f} MB)[/green]"
         )
@@ -2004,16 +2051,30 @@ STDERR:
 
         if cached:
             manifest = load_manifest(feature_dir)
-            if _bundle_has_version(manifest.version):
+            # A cache hit skips publisher.build(), so any artifact the upload
+            # step needs must already be on disk. Besides the versioned UI
+            # bundle, a feature with an agentSource must still have its packaged
+            # zip (package_agent_source.sh output) — it is git-ignored and gets
+            # cleaned between runs, so treat a missing zip as a cache MISS.
+            agent_source = getattr(manifest, "agentSource", None)
+            agent_zip_missing = bool(
+                agent_source
+                and getattr(agent_source, "artifactPath", None)
+                and not (feature_dir / agent_source.artifactPath).is_file()
+            )
+            if _bundle_has_version(manifest.version) and not agent_zip_missing:
                 self.log_cached(
                     f"Feature {feature_dir.name} source unchanged — "
                     f"using cached UI bundle"
                 )
             else:
+                reason = (
+                    "agent-source.zip missing"
+                    if agent_zip_missing
+                    else f"cached bundle does not carry version '{manifest.version}'"
+                )
                 self.log_warning(
-                    f"Feature {feature_dir.name}: cached bundle does not carry "
-                    f"version '{manifest.version}' — forcing a rebuild "
-                    f"(stale dist/ or checksum collision)."
+                    f"Feature {feature_dir.name}: {reason} — forcing a rebuild."
                 )
                 cached = False
 
@@ -2191,6 +2252,30 @@ STDERR:
                 self.log_error(
                     f"Feature {feature_id} declares configPreset.path "
                     f"'{config_preset.path}' but no file exists at {preset_local}"
+                )
+                sys.exit(1)
+
+        # Agent source zip — if the manifest declares an agentSource. The
+        # feature stack's CodeBuild project reads it from
+        # `<FEATURE_ARTIFACT_PREFIX>/<version>/<artifactPath>` (Source.Location)
+        # to build the AgentCore Runtime image at install, so it MUST be uploaded
+        # at that same relative path under the version subfolder. The publisher
+        # (publisher.build) already produced the zip at feature_dir/<artifactPath>.
+        agent_source = getattr(manifest, "agentSource", None)
+        if agent_source and getattr(agent_source, "artifactPath", None):
+            agent_zip_local = feature_dir / agent_source.artifactPath
+            if agent_zip_local.is_file():
+                _upload(
+                    agent_zip_local,
+                    f"{version_root}/{agent_source.artifactPath}",
+                    "application/zip",
+                )
+            else:
+                self.log_error(
+                    f"Feature {feature_id} declares agentSource.artifactPath "
+                    f"'{agent_source.artifactPath}' but no file exists at "
+                    f"{agent_zip_local} — the package step must produce it before "
+                    f"upload. Check agentSource.package / packageCommand."
                 )
                 sys.exit(1)
 
@@ -2443,9 +2528,32 @@ STDERR:
                     "<w2_dataset_deployer_HASH_TOKEN>": self.get_directory_checksum(
                         "src/lambda/w2_dataset_deployer"
                     )[:16],
-                    "<MULTI_DOC_DISCOVERY_BUILD_HASH_TOKEN>": self.get_directory_checksum(
-                        "src/lambda/multi_doc_discovery"
+                    "<CONFBENCH_DEPLOYER_HASH_TOKEN>": self.get_directory_checksum(
+                        "src/lambda/confbench_deployer"
                     )[:16],
+                    # BuildHash is the ONLY meaningful property of the
+                    # DockerBuildRun custom resource, so it is the sole thing
+                    # that re-triggers the container build on a stack update: if
+                    # it doesn't change, CloudFormation sees no delta, never
+                    # re-invokes the resource, and the ECR :latest image keeps
+                    # whatever it had. It must therefore cover EVERY input to the
+                    # image — the handler code AND the Dockerfile/requirements.txt
+                    # the build installs from. Hashing only the handler directory
+                    # meant a Dependabot bump to requirements.txt left BuildHash
+                    # byte-identical and the vulnerable dependency stayed
+                    # deployed (a fresh create always builds, so this is only
+                    # observable on an in-place update).
+                    "<MULTI_DOC_DISCOVERY_BUILD_HASH_TOKEN>": hashlib.sha256(
+                        (
+                            self.get_directory_checksum(
+                                "src/lambda/multi_doc_discovery"
+                            )
+                            + "".join(
+                                self.get_file_checksum(build_input)
+                                for build_input in MULTI_DOC_DISCOVERY_BUILD_INPUTS
+                            )
+                        ).encode()
+                    ).hexdigest()[:16],
                     "<SAMPLE_FEATURES_HASH_TOKEN>": sample_features_hash,
                     "<SAMPLE_FEATURES_LIST_TOKEN>": json.dumps(
                         sample_features_list or []
@@ -2764,6 +2872,11 @@ STDERR:
                 LIB_DEPENDENCY,
                 "nested/multi-doc-discovery/docker_build_lambda",
                 "nested/multi-doc-discovery/template.yaml",
+                # The container image's build inputs. Without these two, a
+                # Dependabot bump to requirements.txt (or a Dockerfile change)
+                # would not invalidate the checksum, so the smart-rebuild logic
+                # would skip the component and keep shipping the old image.
+                *MULTI_DOC_DISCOVERY_BUILD_INPUTS,
                 "src/lambda/multi_doc_discovery",
             ],
             # Unified pattern (combines BDA + Pipeline)

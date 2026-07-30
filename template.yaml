@@ -2512,6 +2512,11 @@ Resources:
       ClientSecret: !GetAtt ExternalAppClient.ClientSecret
       ConnectorClientId: !Ref MCPConnectorClient
       ExecutionRoleArn: !GetAtt AgentCoreGatewayExecutionRole.Arn
+      # Bump when IDP_TOOLS_SCHEMA in the gateway manager Lambda changes.
+      # Custom resources only re-run when a property changes; this forces the
+      # manager to run on stack update and re-sync the gateway target's tool
+      # schema (update_gateway_target_if_needed) onto existing deployments.
+      ToolSchemaVersion: "2026-07-26-get-results-document-id"
       SourceCodeHash: <LAMBDA_HASH_TOKEN>
 
   ##########################################################################
@@ -2908,6 +2913,18 @@ Resources:
         # host's Rules Discovery flow (sample-health-insurance-review) know where
         # uploadDiscoveryDocument presigns uploads.
         DiscoveryBucketName: !Ref DiscoveryBucket
+        # Input bucket name re-exported so a preprocessing feature (e.g. PII
+        # anonymization) can read source documents and write a redacted copy
+        # back under a reserved prefix to spawn a new de-identified execution.
+        InputBucketName: !Ref InputBucket
+        # UsersTable re-exported so a feature can RBAC-gate a sensitive view by
+        # the caller's allowedConfigVersions (e.g. PII mapping in the Redaction
+        # Report is shown only to users allowed the original's config version).
+        UsersTableName: !Ref UsersTable
+        UsersTableArn: !GetAtt UsersTable.Arn
+        # Test Set bucket name re-exported so feature stacks that generate test
+        # sets (idp-data-generator) can write documents Test Studio discovers.
+        TestSetBucketName: !Ref TestSetBucket
         # Reporting bucket name re-exported (as name + ARN) so feature stacks
         # that read reporting/analytics data or write Athena query results
         # (e.g. idp-monitor) can grant themselves scoped s3 access. Mirrors the
@@ -3744,6 +3761,97 @@ Resources:
       DatasetName: "RealKIE-FCC-Verified"
       DatasetDescription: "Test set with single and multi-page invoices sourced from the Federal Communications Commission (FCC) to evaluate extraction performance."
       SourceCodeHash: <FCC_DATASET_DEPLOYER_HASH_TOKEN>
+
+  ##########################################################################
+  # ConfBench Deployer - Automatically deploys ConfBench dataset (augmented FCC invoices)
+  ##########################################################################
+
+  ConfbenchDeployerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt CustomerManagedEncryptionKey.Arn
+      RetentionInDays: !Ref LogRetentionDays
+
+  ConfbenchDeployerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Function does not require VPC access as it only interacts with AWS services via APIs"
+          - id: W92
+            reason: "Function does not require reserved concurrency as it scales based on demand"
+    # checkov:skip=CKV_AWS_116: "DLQ not required for Cfn Custom Resource function"
+    # checkov:skip=CKV_AWS_117: "Function does not require VPC access as it only interacts with AWS services via APIs"
+    # checkov:skip=CKV_AWS_115: "Function does not require reserved concurrency as it scales based on demand"
+    # checkov:skip=CKV_AWS_173: "Environment variables do not contain sensitive data - only configuration values like feature flags and non-sensitive settings"
+    Properties:
+      PermissionsBoundary:
+        !If [
+          HasPermissionsBoundary,
+          !Ref PermissionsBoundaryArn,
+          !Ref AWS::NoValue,
+        ]
+      FunctionName: !Sub "${AWS::StackName}-ConfbenchDeployer"
+      CodeUri: src/lambda/confbench_deployer/
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 2048
+      VpcConfig:
+        !If
+          - DeployInVPC
+          - SecurityGroupIds:
+              - !Ref LambdaSecurityGroupId
+            SubnetIds: !Ref PrivateSubnetIds
+          - !Ref AWS::NoValue
+      LoggingConfig:
+        LogGroup: !Ref ConfbenchDeployerLogGroup
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          TESTSET_BUCKET: !Ref TestSetBucket
+          TRACKING_TABLE: !Ref TrackingTable
+          S3_ENDPOINT_URL: !If
+            - HasS3VpcEndpointAndVpc
+            - !Sub
+              - "https://bucket.${VpceDnsName}"
+              # Only the BYO override provides an S3 VPC endpoint now (APIGateway
+              # hosting uses API Gateway's internal S3 integration, no VPCE). The
+              # S3PresignedUrlViaVpcEndpointRequiresEndpoint rule guarantees the
+              # override is set whenever UseS3VpcEndpointForPresigner is true.
+              - VpceDnsName: !Ref S3VpcEndpointDnsNameOverride
+            - !Ref AWS::NoValue
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref TestSetBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TrackingTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt CustomerManagedEncryptionKey.Arn
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ConfbenchDeployer"
+
+  ConfbenchDeployment:
+    Type: Custom::ConfbenchDeployer
+    DependsOn:
+      - TestSetBucket
+      - TrackingTable
+    Properties:
+      ServiceToken: !GetAtt ConfbenchDeployerFunction.Arn
+      DatasetVersion: "0.3"
+      DatasetName: "ConfBench"
+      DatasetDescription: "An augmentation of FCC Invoices Verified, each document degraded by up to 18 distinct pipelines to support confidence calibration research, OCR robustness evaluation, and key information extraction (KIE) under realistic noise conditions."
+      SourceCodeHash: <CONFBENCH_DEPLOYER_HASH_TOKEN>
 
   ##########################################################################
   # OCR Benchmark Deployer - Automatically deploys OmniAI OCR Benchmark dataset
@@ -5780,6 +5888,9 @@ Resources:
           DOCUMENT_TRACKING_MODE: "dynamodb"
           TRACKING_TABLE: !Ref TrackingTable
           OUTPUT_BUCKET: !Ref OutputBucket
+          # Needed to fully delete an original superseded by a redacted copy
+          # (REDACTED_SUPERSEDED terminal status from a preprocessing hook).
+          INPUT_BUCKET: !Ref InputBucket
           REPORTING_BUCKET:
             !If [
               ShouldCreateReportingBucket,
@@ -5806,17 +5917,32 @@ Resources:
         - S3CrudPolicy:
             BucketName: !Ref WorkingBucket
         # Document version manifests: enumerate output object versions and
-        # write runs/<run_id>/manifest.json to the output bucket.
+        # write runs/<run_id>/manifest.json to the output bucket. Also delete
+        # output objects when fully deleting a REDACTED_SUPERSEDED original.
         - Statement:
             - Effect: Allow
               Action:
                 - s3:ListBucketVersions
+                - s3:ListBucket
               Resource: !GetAtt OutputBucket.Arn
             - Effect: Allow
               Action:
                 - s3:GetObject
                 - s3:PutObject
+                - s3:DeleteObject
               Resource: !Sub "${OutputBucket.Arn}/*"
+        # Delete the input object of a REDACTED_SUPERSEDED original (the
+        # redacted copy replaces it). Input bucket read/list/delete.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt InputBucket.Arn
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub "${InputBucket.Arn}/*"
         - Statement:
             - Effect: Allow
               Action:
@@ -7168,6 +7294,7 @@ Resources:
           CHAT_SESSIONS_TABLE: !Ref ChatSessionsTable
           ID_HELPER_CHAT_MEMORY_TABLE: !Ref IdHelperChatMemoryTable
           MEMORY_METHOD: dynamodb
+          MAIN_STACK_NAME: !Ref AWS::StackName
           STREAMING_ENABLED: true
           MAX_CONVERSATION_TURNS: 20
           MAX_MESSAGE_SIZE_KB: 8.5
@@ -7223,6 +7350,13 @@ Resources:
             TableName: !Ref IdHelperChatMemoryTable
         - DynamoDBCrudPolicy:
             TableName: !Ref ConfigurationTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/feature-platform/installed-features-table"
+            - Effect: Allow
+              Action: [dynamodb:Scan, dynamodb:GetItem]
+              Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-FeaturePlatformStack-*"
         # Read the samples manifest (config_library/samples-manifest.json) the
         # list_sample_documents tool surfaces to the Quick Start agent.
         - Statement:
@@ -7457,6 +7591,7 @@ Resources:
           CHAT_SESSIONS_TABLE: !Ref ChatSessionsTable
           ID_HELPER_CHAT_MEMORY_TABLE: !Ref IdHelperChatMemoryTable
           MEMORY_METHOD: dynamodb
+          MAIN_STACK_NAME: !Ref AWS::StackName
           STREAMING_ENABLED: true
           MAX_CONVERSATION_TURNS: 20
           MAX_MESSAGE_SIZE_KB: 8.5
@@ -7496,6 +7631,13 @@ Resources:
             TableName: !Ref ChatSessionsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref IdHelperChatMemoryTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/feature-platform/installed-features-table"
+            - Effect: Allow
+              Action: [dynamodb:Scan, dynamodb:GetItem]
+              Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-FeaturePlatformStack-*"
         - Statement:
             - Effect: Allow
               Action: s3:GetObject
@@ -9560,7 +9702,10 @@ Resources:
         ]
       Handler: index.handler
       Runtime: python3.12
-      Timeout: 60
+      # Long enough for the OperationAborted retry ladder below (~5 min of
+      # backoff) plus overhead. S3 serializes conflicting bucket-config writes,
+      # and a rollback fires several of them at once.
+      Timeout: 420
       VpcConfig:
         !If
           - DeployInVPC
@@ -9573,19 +9718,64 @@ Resources:
         import cfnresponse
         import json
         import logging
+        import time
+
+        from botocore.exceptions import ClientError
 
         logger = logging.getLogger()
         logger.setLevel(logging.INFO)
 
+        # S3 allows only ONE conditional bucket-config operation at a time. A
+        # CloudFormation rollback/delete tears down TestSetBucketPolicy,
+        # TestSetBucketAutoDelete and this notification config concurrently, so
+        # PutBucketNotificationConfiguration intermittently returns
+        # OperationAborted ("A conflicting conditional operation is currently in
+        # progress"). It is purely transient - the same call succeeds moments
+        # later - so retry with backoff instead of failing the resource.
+        RETRY_DELAYS = [2, 5, 10, 20, 30, 45, 60, 60, 60, 60]
+        RETRYABLE_CODES = {'OperationAborted', 'SlowDown', 'RequestTimeout',
+                           'InternalError', 'ServiceUnavailable',
+                           'TooManyRequests'}
+
+
+        def put_notification_with_retry(s3_client, bucket_name, notification_config):
+            """PutBucketNotificationConfiguration, retrying transient conflicts."""
+            last_error = None
+            for attempt, delay in enumerate([0] + RETRY_DELAYS, start=1):
+                if delay:
+                    logger.warning(
+                        "Retrying bucket notification config for %s in %ss "
+                        "(attempt %s) after %s",
+                        bucket_name, delay, attempt, last_error
+                    )
+                    time.sleep(delay)
+                try:
+                    s3_client.put_bucket_notification_configuration(
+                        Bucket=bucket_name,
+                        NotificationConfiguration=notification_config
+                    )
+                    return
+                except ClientError as e:
+                    code = e.response.get('Error', {}).get('Code', '')
+                    if code not in RETRYABLE_CODES:
+                        raise
+                    last_error = code
+            raise RuntimeError(
+                f"PutBucketNotificationConfiguration on {bucket_name} still "
+                f"failing with {last_error} after {len(RETRY_DELAYS) + 1} attempts"
+            )
+
+
         def handler(event, context):
             logger.info(json.dumps(event))
-            
+
+            request_type = event['RequestType']
             try:
                 s3_client = boto3.client('s3')
                 bucket_name = event['ResourceProperties']['BucketName']
                 function_arn = event['ResourceProperties']['FunctionArn']
-                
-                if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+
+                if request_type == 'Create' or request_type == 'Update':
                     # Configure bucket notification
                     notification_config = {
                         'LambdaFunctionConfigurations': [
@@ -9606,25 +9796,32 @@ Resources:
                             }
                         ]
                     }
-                    
-                    s3_client.put_bucket_notification_configuration(
-                        Bucket=bucket_name,
-                        NotificationConfiguration=notification_config
+
+                    put_notification_with_retry(
+                        s3_client, bucket_name, notification_config
                     )
-                    
-                elif event['RequestType'] == 'Delete':
+
+                elif request_type == 'Delete':
                     # Remove bucket notification
-                    s3_client.put_bucket_notification_configuration(
-                        Bucket=bucket_name,
-                        NotificationConfiguration={}
-                    )
-                
+                    put_notification_with_retry(s3_client, bucket_name, {})
+
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                
+
             except Exception as e:
                 logger.error(f"Error: {str(e)}")
-                cfnresponse.send(event, context, cfnresponse.FAILED, {}, 
-                               reason=f"Error configuring bucket notification: {str(e)}")
+                if request_type == 'Delete':
+                    # Never block a stack delete/rollback on cleanup of a
+                    # notification config: the bucket itself is Retain, and a
+                    # DELETE_FAILED here wedges the whole stack in
+                    # ROLLBACK_FAILED (requiring manual intervention) for a
+                    # resource that no longer matters. Mirrors the
+                    # best-effort-succeed behavior of
+                    # TestSetBucketAutoDeleteFunction.
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                     reason=f"Notification cleanup attempted: {str(e)}")
+                else:
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                     reason=f"Error configuring bucket notification: {str(e)}")
       Policies:
         - Statement:
             - Effect: Allow
@@ -9638,6 +9835,13 @@ Resources:
     DependsOn:
       - TestSetZipExtractorFunctionInvokePermission
       - TestSetZipExtractorS3Policy
+      # Serialize against the other conditional bucket-config write on
+      # TestSetBucket. Without this, CloudFormation creates (and, in reverse,
+      # deletes) the policy and this notification config in the same instant,
+      # and S3 rejects the second with OperationAborted. Ordering them costs
+      # nothing and removes the race at the source; the retry ladder in the
+      # handler above covers any residual conflict from outside this stack.
+      - TestSetBucketPolicy
     Properties:
       ServiceToken: !GetAtt TestSetBucketNotificationFunction.Arn
       BucketName: !Ref TestSetBucket
@@ -10619,6 +10823,51 @@ Resources:
       # Force codebuild to rerun when source code changes (filename will change), and to correctly roll back to
       # previous version if build fails.
       CodeLocation: !Sub "arn:${AWS::Partition}:s3:::<ARTIFACT_BUCKET_TOKEN>/<ARTIFACT_PREFIX_TOKEN>/<WEBUI_ZIPFILE_TOKEN>"
+      # Force codebuild to rerun when a CloudFormation parameter that Vite BAKES
+      # INTO the bundle changes. This property is the only thing that makes a
+      # parameter-only stack update rebuild the UI.
+      #
+      # Why it is needed: the UI reads these as `import.meta.env.VITE_*`, which
+      # Vite substitutes textually at `npm run build` and freezes into the JS in
+      # WebUIBucket. Changing the parameter updates UICodeBuildProject's env var,
+      # but mutating a CodeBuild project definition does NOT run a build — only
+      # this custom resource does, via start_build. Without a property diff here,
+      # CloudFormation skips the resource entirely (no Update event, no build) and
+      # the previously-built bundle stays deployed, so the change silently has no
+      # effect in the UI. A fresh stack create always runs the build once, which
+      # is why this gate is invisible to create-only testing.
+      #
+      # Regression that prompted this: adding AllowedSignUpEmailDomain to an
+      # existing stack correctly flipped the backend (UserPool
+      # AllowAdminCreateUserOnly=false + the PreSignUp domain-verify Lambda) but
+      # the login page kept hiding the Sign Up tab, because VITE_SHOULD_HIDE_SIGN_UP
+      # was still "true" in the stale bundle.
+      #
+      # ONLY list parameters that are baked in at build time. Values resolved at
+      # runtime (the SSM settings parameter read by useParameterStore, e.g.
+      # ConsoleTitle / DefaultFeatureId) must NOT be here — they already take
+      # effect without a rebuild, and adding them would force needless 30-minute
+      # UI rebuilds. Keep in sync with the VITE_* vars in UICodeBuildProject that
+      # derive from a CFN parameter.
+      UIBuildInputs: !Join
+        - "|"
+        - # -> VITE_SHOULD_HIDE_SIGN_UP (hideSignUp on the Authenticator)
+          - !Ref AllowedSignUpEmailDomain
+          # -> VITE_EXTERNAL_IDP_NAME / VITE_COGNITO_DOMAIN (federated sign-in
+          #    button + Amplify OAuth config in aws-exports.js)
+          - !Ref ExternalIdPType
+          - !Ref ExternalIdPName
+          # -> VITE_EXTERNAL_IDP_AUTO_LOGIN (auto-redirect to the IdP)
+          - !Ref ExternalIdPAutoLogin
+          # -> VITE_ENABLE_QUICK_START_WIDGET
+          - !Ref EnableQuickStartWidget
+          # -> VITE_UI_BASE_PATH + VITE_CLOUDFRONT_DOMAIN (Vite `base`, so every
+          #    asset URL in the bundle) and the CloudFront-invalidation branch of
+          #    the buildspec
+          - !Ref WebUIHosting
+          # -> VITE_CLOUDFRONT_DOMAIN (empty when set, so OAuth redirects fall
+          #    back to window.location.origin)
+          - !Ref CustomDomainUrl
 
   ##########################################################################
   # HITL User Management Lambda

@@ -25,10 +25,37 @@ its `make` target and the skill that documents how to run it.
 | Release-vs-release benchmark | `make benchmark-release …` (alias `make stacktest-benchmark`) | `.claude/skills/run-benchmarks.md` |
 | In-place upgrade (X→Y) test | `make stacktest-upgrade` (pointer) | `.claude/skills/test-upgrade.md` |
 | Full offline test battery (no AWS) | `make test` | `.claude/skills/full-test-battery.md` |
+| Run security tests + curate a public-safe snapshot | `make security-results [STACK_NAME=… REGION=…]` (offline-only if no stack) | `.claude/skills/curate-security-results.md` |
 
 VPC stack-tests auto-discover a suitable VPC via the `run-stack-tests` skill
 (it lists candidates, confirms with you, then passes `VPC_ID`/`SUBNET_IDS`/
 `LAMBDA_SG_ID`/`APIGW_VPCE_ID` as make params).
+
+## Security tests: coverage & auditable results
+
+The four security tests — **SRT** (SAST/deps), **ZAP DAST** (dynamic API scan),
+and **RBAC static + dynamic** (authorization) — are documented as a set, with
+their goals and threat-model cross-references, in
+[`security/README.md`](../../../security/README.md). For a release, run them and
+curate a **public-safe, redacted** snapshot into `security/test-results/<version>/`
+(one file per test + a `MANIFEST.md` tying the results to a version, git SHA,
+and date) with a single command:
+
+```bash
+make security-results STACK_NAME=<stack> REGION=<region>   # full (incl. live ZAP + RBAC)
+make security-results                                      # offline-only (SRT + RBAC static)
+```
+
+(Or ask Claude Code: *"run security tests and update results"*. To curate from
+already-run reports without re-running:
+`python3 scripts/security/curate_results.py --date <YYYY-MM-DD> [--version <label>]`.)
+
+Raw reports carry environment-specific identifiers (account IDs, Cognito pool
+IDs, API hostnames) and stay in gitignored `scratch/`/`.srt/` — only the curated
+summaries are committed. See
+[`.claude/skills/curate-security-results.md`](../../../.claude/skills/curate-security-results.md)
+for the runbook and [`security/test-results/README.md`](../../../security/test-results/README.md)
+for the process.
 
 ## Pipeline stages & triggers
 
@@ -78,6 +105,16 @@ Notes:
   of active MRs (typically ≤5) — not a hard cap. If concurrent deploys ever
   exhaust account quotas, revert to a single shared `resource_group:
   integration_deploy`.
+- **Auto-cancel is disabled on `develop`** (`workflow` rule with
+  `auto_cancel: on_new_commit: none`). Previously, *any* new push to develop —
+  including a doc-only commit whose pipeline skips the deploy stages — would
+  auto-cancel the in-flight ~1h integration deploy of the prior commit, and
+  that deploy was never re-run (the merge went permanently untested). Now every
+  develop pipeline runs to completion; back-to-back deploys serialize via the
+  resource_group rather than superseding each other. MR pipelines keep the
+  default supersede-on-push behavior (there, `changes:` compares against the
+  target branch, so a doc push to an MR that still touches deploy-affecting
+  files re-runs the deploy anyway).
 
 ## Test Execution Strategy
 

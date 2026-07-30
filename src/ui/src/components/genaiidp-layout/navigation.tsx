@@ -61,7 +61,7 @@ const withNavHotspots = (items: readonly SideNavigationProps.Item[]): SideNaviga
   items.map((item) => {
     if (item.type === 'section' && Array.isArray((item as SideNavigationProps.Section).items)) {
       const section = item as SideNavigationProps.Section;
-      if (section.text === 'Extensions (Preview)' && section.items.length > 0) {
+      if (section.text === 'Extensions' && section.items.length > 0) {
         const [first, ...rest] = section.items;
         const firstWithHotspot = first.type === 'link' ? withInfoHotspot(first as SideNavigationProps.Link, 'nav-extensions') : first;
         return { ...section, items: [firstWithHotspot, ...rest] };
@@ -540,7 +540,7 @@ const Navigation = ({
   }
 
   return (
-    <>
+    <div className="idp-side-nav">
       {isQuickStartWidgetEnabled() && (
         <div className="nav-quick-start">
           <Hotspot hotspotId="nav-quick-start" side="right">
@@ -556,7 +556,7 @@ const Navigation = ({
         activeHref={activeHref}
         onFollow={onFollowHandler}
       />
-    </>
+    </div>
   );
 };
 

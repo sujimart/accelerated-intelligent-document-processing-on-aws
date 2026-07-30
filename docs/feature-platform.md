@@ -152,7 +152,7 @@ flowchart LR
 |-----------|----------|---------|
 | `FeaturePlatformStack` | nested stack from `feature-platform/main-stack-extensions/template.yaml` | Owns the `InstalledFeatures` table, the feature-platform Lambdas, and AppSync data sources / resolvers |
 | `FeatureBucket` | main `template.yaml`, condition-gated on `EnableFeaturePlatform` | Holds the catalog of published features (CFN template + UI bundle + `feature.yaml` manifest per feature). Auto-created and pre-populated with the bundled sample feature unless `FeaturePlatformFeatureBucket` is supplied. |
-| Pipeline hooks | `patterns/unified/` (`PipelineHooksDispatcherFunction` + `postHook` config) | Lets features inject Lambdas at six post-step extension points in the processing workflow. Inert when no hooks are registered. |
+| Pipeline hooks | `patterns/unified/` (`PipelineHooksDispatcherFunction` + `preprocessing` / `postHook` config) | Lets features inject Lambdas at the `preprocessing` point and five post-step extension points in the processing workflow. Inert when no hooks are registered. |
 | Feature stack | standalone CFN template published by the author via `idp-feature-cli publish` | Creates the feature's own resources + registers into the main stack |
 
 ### GraphQL surface
@@ -173,15 +173,46 @@ Each GraphQL operation is backed by a Lambda under
 
 ## Pipeline hooks
 
-Features can inject custom Lambdas at six post-step extension points in the
-unified processing workflow: `postOcr`, `postClassification`, `postExtraction`,
-`postAssessment`, `postRuleValidation`, `postSummarization`. After each step the
-Step Functions workflow invokes `PipelineHooksDispatcherFunction`, which runs
-any hook Lambdas registered for that point.
+Features can inject custom Lambdas at extension points in the unified
+processing workflow. There are two kinds:
+
+- **`preprocessing`** — a single hook that runs **FIRST**, before the
+  BDA/pipeline routing decision, so it fires in both processing modes and even
+  when OCR is disabled. It operates on the *source document* (before any OCR
+  output exists) and can **halt** the execution by returning `halt: true` —
+  used by the [PII Anonymization extension](extensions/pii-anonymizer.md) to
+  short-circuit an original whose only purpose was to spawn a redacted copy.
+  While it runs, the document's status shows **`PREPROCESSING`**.
+- **Five post-step points** — `postOcr`, `postClassification`,
+  `postExtraction`, `postRuleValidation`, `postSummarization` — invoked after
+  the corresponding step. (`postAssessment` was removed in v0.6 when
+  assessment folded into extraction.)
+
+At each point the Step Functions workflow invokes
+`PipelineHooksDispatcherFunction`, which runs any hook Lambdas registered for
+that point.
 
 **Inert by default** — hooks are stored inline in the active configuration
-version under each step's `postHook` list. With no `postHook` entries the
-dispatcher returns after a single DynamoDB read and the pipeline is unchanged.
+version. With none registered the dispatcher returns after a single DynamoDB
+read and the pipeline is unchanged.
+
+**`preprocessing` shape** — a standalone top-level config section holding ONE
+flat hook (no list; the hook's own settings travel in generic `args` key/value
+pairs, keeping the platform hook-agnostic). Editable in the View/Edit
+Configuration UI:
+
+```yaml
+preprocessing:
+  enabled: true               # default false
+  featureId: pii-anonymizer   # owner label (for traceability)
+  arn: <hook-lambda-arn>      # Lambda to invoke
+  onError: fail               # continue | fail — use fail when the hook MUST
+                              # gate processing (a failure ends the execution
+                              # via a terminal Fail state; it never falls
+                              # through to processing the unprocessed original)
+  args:                       # hook-specific settings, opaque to the platform
+    - { key: mode, value: redactcopy_and_stop }
+```
 
 **`postHook` entry shape** (per step, in the active config version):
 
@@ -193,18 +224,98 @@ extraction:
       order: 100                # lower runs first within a point (default 100)
       onError: continue         # continue | skip-remaining | fail (default continue)
       enabled: true             # default true
+      allowDocumentUpdate: true # default true — may this hook return an
+                                # `updatedDocument`? Set false to pin it to
+                                # observe-only (see "Modifying the document")
 ```
 
 **Hook Lambda contract** — invoked synchronously (`RequestResponse`) with:
 
 ```json
 { "hookPoint": "postExtraction", "featureId": "my-feature",
-  "document": { ... }, "section": { ... }, "executionArn": "arn:aws:states:..." }
+  "document": { ... }, "section": { ... }, "executionArn": "arn:aws:states:...",
+  "args": [ { "key": "...", "value": "..." } ], "argsMap": { "...": "..." } }
 ```
 
-It returns any JSON result (surfaced under `$.HookResults`). `onError`
-controls failure handling: `continue` (log and proceed), `skip-remaining` (stop
-later hooks at that point), or `fail` (fail the workflow).
+It returns any JSON result (surfaced under `$.HookResults`). A `preprocessing`
+hook may include `"halt": true` in its result to end the execution (the
+document is marked according to the hook's semantics — e.g.
+`REDACTED_SUPERSEDED` for PII redaction). `onError` controls failure handling:
+`continue` (log and proceed), `skip-remaining` (stop later hooks at that
+point), or `fail` (fail the workflow — for `preprocessing` this stops the
+execution in a terminal `PreprocessingHookFailed` state rather than continuing
+to normal processing).
+
+**Modifying the document (optional)** — a hook is not limited to observing. To
+change what the *next* workflow step consumes, return the modified document
+under `updatedDocument`:
+
+```json
+{ "updatedDocument": { ...document... }, "myOwnField": "whatever" }
+```
+
+This is how a hook injects business logic into the pipeline itself —
+relabelling a section's classification, adding or dropping sections, correcting
+extracted attributes, adjusting confidence alerts, or appending metering — as
+opposed to only rewriting the S3 objects the document points at.
+
+The document may be returned either **inline** (the dispatcher spills it to the
+working bucket for you) or as a **compressed reference** the hook wrote itself
+(`{compressed: true, s3_uri, document_id, sections, num_pages, config_version}`),
+which has no size ceiling. Use
+[`idp_common.hooks`](feature-platform-developer-guide.md#writing-a-mutating-hook)
+to get the round-trip right in two calls.
+
+Omit `updatedDocument` and nothing changes — the document passes through
+byte-identical, which is why every hook written before this capability existed
+keeps working unmodified.
+
+Guardrails the dispatcher enforces (a violation is **refused**, leaving the
+document at its pre-hook value and recording the reason in
+`$.HookResults.<point>.Payload.results[].documentUpdateRejected` — it never
+fails the workflow):
+
+| Rule | Why |
+|---|---|
+| `id` / `input_key` / `input_bucket` / `output_bucket` are immutable | The tracking-table row and output S3 prefixes are keyed off them. A hook that needs a *different* document should spawn one and `halt`. |
+| `sections` in a compressed reference must be a list of section-id strings | The workflow's `ProcessSections` Map iterates it directly, so a malformed value would fail the whole execution. |
+| `config_version` is preserved | It resolves hooks for the rest of the pipeline; a changed value is restored (the content change is still honored). |
+| A compressed reference's `s3_uri` must be under `compressed_documents/` in the stack's working bucket | Downstream, `Document.decompress()` parses the URI but *discards its bucket*, reading the key against the consumer's own working bucket — so an unconstrained URI is a key-injection vector, not just a cross-bucket read. |
+| Inline documents are capped at 5 MB | Bounded by Lambda's own 6 MB synchronous response limit. Return a compressed reference instead. |
+
+Some fields the state machine reads by JSONPath are **not** `Document` model
+fields, so a hook's load → mutate → return round-trip drops them — and an
+absent one fails the execution outright rather than degrading. The dispatcher
+back-fills these from the inbound document, and a hook that sets one explicitly
+keeps its own value:
+
+- `use_bda`, `bda_project_arn` — the BDA/pipeline routing Choice and the BDA
+  invoke parameters.
+- `num_pages`, `status`, `sections` — the compressed wrapper's own metadata,
+  read by `BDA_CheckExistingData` and by `ProcessSections`' `ItemsPath`. The
+  `idp_common.hooks` helper and the dispatcher's inline path always emit these;
+  the back-fill covers a hand-rolled compressed reference that omits them.
+
+**Write idempotent mutations.** The workflow retries a hook dispatch on
+transient Lambda faults, which re-invokes the hook — so a mutation that
+*appends* (`classification += "-SUFFIX"`) can apply twice, while one that *sets*
+(`classification = "Invoice"`) is safe. Guard append-style logic against
+re-application.
+
+Chained hooks at the same point **compose**: hook #2 receives hook #1's
+document, in `order`. Set `allowDocumentUpdate: false` on a hook entry to pin it
+to observe-only.
+
+**Where a mutation reaches** — the hook point determines scope:
+
+| Point | Document scope | Propagates to |
+|---|---|---|
+| `preprocessing` | Whole document, pre-OCR | Everything downstream |
+| `postOcr` | Whole document + page results | Classification onward |
+| `postClassification` | Whole document | The `ProcessSections` Map fan-out (section adds/removes/relabels) and everything after |
+| `postExtraction` | **A single section** (runs inside the Map) | Assessment, then `sections[0]` + `metering` are merged into the final document — top-level and page-level changes made here are discarded |
+| `postRuleValidation` | Whole document | Summarization, evaluation, final output |
+| `postSummarization` | Whole document | Evaluation and the final workflow output |
 
 **Security** — the dispatcher's `lambda:InvokeFunction` is scoped so a hook
 Lambda must either carry the `idp:feature-id` resource tag (ABAC, used by

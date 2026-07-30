@@ -34,6 +34,7 @@ class BootstrapRequest:
     augment: bool = False
     model_id: Optional[str] = None
     example_doc_keys: List[str] = field(default_factory=list)
+    scenario: str = ""
 
 
 @dataclass
@@ -207,7 +208,7 @@ def run_bootstrap(
         count=request.doc_count,
         threshold=request.quality_threshold,
         augment=request.augment,
-        extra=request.prompt,
+        extra=request.scenario or request.prompt,
         model_id=request.model_id,
     )
     try:
@@ -239,8 +240,14 @@ def run_bootstrap(
 
     test_set_id = target_version
     _report(95.0, f"Registering test set '{test_set_id}'")
+    import uuid as _uuid
+
     uploaded = packet_io.upload_packet_to_test_set(
-        documents, test_set_id, test_set_bucket, s3_client=s3_client
+        documents,
+        test_set_id,
+        test_set_bucket,
+        s3_client=s3_client,
+        name_prefix=f"{_uuid.uuid4().hex[:8]}_",
     )
     result.test_set_id = test_set_id
     result.docs_generated = uploaded
